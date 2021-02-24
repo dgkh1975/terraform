@@ -81,7 +81,7 @@ func (c *ValidateCommand) Run(args []string) int {
 	// not be valid for a stable release, so we'll warn about that in case
 	// the user is trying to use "terraform validate" as a sort of pre-flight
 	// check before submitting a change.
-	diags = diags.Append(c.providerDevOverrideWarnings())
+	diags = diags.Append(c.providerDevOverrideRuntimeWarnings())
 
 	return c.showResults(diags, jsonOutput)
 }
@@ -240,7 +240,7 @@ func (c *ValidateCommand) Synopsis() string {
 
 func (c *ValidateCommand) Help() string {
 	helpText := `
-Usage: terraform validate [options] [dir]
+Usage: terraform [global options] validate [options] [dir]
 
   Validate the configuration files in a directory, referring only to the
   configuration and not accessing any remote services such as remote state,

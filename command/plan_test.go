@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -11,7 +12,6 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/mitchellh/cli"
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/addrs"
@@ -30,17 +30,19 @@ func TestPlan(t *testing.T) {
 	defer testChdir(t, td)()
 
 	p := planFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
 	args := []string{}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 }
 
@@ -57,20 +59,21 @@ func TestPlan_lockedState(t *testing.T) {
 	defer unlock()
 
 	p := planFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
 	args := []string{}
-	if code := c.Run(args); code == 0 {
-		t.Fatal("expected error")
+	code := c.Run(args)
+	if code == 0 {
+		t.Fatal("expected error", done(t).Stdout())
 	}
 
-	output := ui.ErrorWriter.String()
+	output := done(t).Stderr()
 	if !strings.Contains(output, "lock") {
 		t.Fatal("command output does not look like a lock error:", output)
 	}
@@ -83,21 +86,28 @@ func TestPlan_plan(t *testing.T) {
 	planPath := testPlanFileNoop(t)
 
 	p := testProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
 	args := []string{planPath}
-	if code := c.Run(args); code != 1 {
-		t.Fatalf("wrong exit status %d; want 1\nstderr: %s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 1 {
+		t.Fatalf("wrong exit status %d; want 1\nstderr: %s", code, output.Stderr())
 	}
 }
 
 func TestPlan_destroy(t *testing.T) {
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
 	originalState := states.BuildState(func(s *states.SyncState) {
 		s.SetResourceInstanceCurrent(
 			addrs.Resource{
@@ -119,11 +129,11 @@ func TestPlan_destroy(t *testing.T) {
 	statePath := testStateFile(t, originalState)
 
 	p := planFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
@@ -131,10 +141,11 @@ func TestPlan_destroy(t *testing.T) {
 		"-destroy",
 		"-out", outPath,
 		"-state", statePath,
-		testFixturePath("plan"),
 	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
 	plan := testReadPlan(t, outPath)
@@ -146,23 +157,25 @@ func TestPlan_destroy(t *testing.T) {
 }
 
 func TestPlan_noState(t *testing.T) {
-	tmp, cwd := testCwd(t)
-	defer testFixCwd(t, tmp, cwd)
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
 	p := planFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
-	args := []string{
-		testFixturePath("plan"),
-	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	args := []string{}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
 	// Verify that refresh was called
@@ -172,25 +185,26 @@ func TestPlan_noState(t *testing.T) {
 
 	// Verify that the provider was called with the existing state
 	actual := p.PlanResourceChangeRequest.PriorState
-	expected := cty.NullVal(p.GetSchemaResponse.ResourceTypes["test_instance"].Block.ImpliedType())
+	expected := cty.NullVal(p.GetProviderSchemaResponse.ResourceTypes["test_instance"].Block.ImpliedType())
 	if !expected.RawEquals(actual) {
 		t.Fatalf("wrong prior state\ngot:  %#v\nwant: %#v", actual, expected)
 	}
 }
 
 func TestPlan_outPath(t *testing.T) {
-	tmp, cwd := testCwd(t)
-	defer testFixCwd(t, tmp, cwd)
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
-	td := testTempDir(t)
 	outPath := filepath.Join(td, "test.plan")
 
 	p := planFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
@@ -200,16 +214,22 @@ func TestPlan_outPath(t *testing.T) {
 
 	args := []string{
 		"-out", outPath,
-		testFixturePath("plan"),
 	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
 	testReadPlan(t, outPath) // will call t.Fatal itself if the file cannot be read
 }
 
 func TestPlan_outPathNoChange(t *testing.T) {
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
 	originalState := states.BuildState(func(s *states.SyncState) {
 		s.SetResourceInstanceCurrent(
 			addrs.Resource{
@@ -232,25 +252,25 @@ func TestPlan_outPathNoChange(t *testing.T) {
 	})
 	statePath := testStateFile(t, originalState)
 
-	td := testTempDir(t)
 	outPath := filepath.Join(td, "test.plan")
 
 	p := planFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
 	args := []string{
 		"-out", outPath,
 		"-state", statePath,
-		testFixturePath("plan"),
 	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
 	plan := testReadPlan(t, outPath)
@@ -292,7 +312,7 @@ func TestPlan_outBackend(t *testing.T) {
 
 	outPath := "foo"
 	p := testProvider()
-	p.GetSchemaResponse = &providers.GetSchemaResponse{
+	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
 		ResourceTypes: map[string]providers.Schema{
 			"test_instance": {
 				Block: &configschema.Block{
@@ -315,20 +335,22 @@ func TestPlan_outBackend(t *testing.T) {
 			PlannedState: req.ProposedNewState,
 		}
 	}
-	ui := cli.NewMockUi()
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
 	args := []string{
 		"-out", outPath,
 	}
-	if code := c.Run(args); code != 0 {
-		t.Logf("stdout: %s", ui.OutputWriter.String())
-		t.Fatalf("plan command failed with exit code %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Logf("stdout: %s", output.Stdout())
+		t.Fatalf("plan command failed with exit code %d\n\n%s", code, output.Stderr())
 	}
 
 	plan := testReadPlan(t, outPath)
@@ -360,24 +382,28 @@ func TestPlan_outBackend(t *testing.T) {
 }
 
 func TestPlan_refreshFalse(t *testing.T) {
-	tmp, cwd := testCwd(t)
-	defer testFixCwd(t, tmp, cwd)
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
 	p := planFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
 	args := []string{
 		"-refresh=false",
-		testFixturePath("plan"),
 	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
 	if p.ReadResourceCalled {
@@ -386,24 +412,31 @@ func TestPlan_refreshFalse(t *testing.T) {
 }
 
 func TestPlan_state(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
 	originalState := testState()
 	statePath := testStateFile(t, originalState)
 
 	p := planFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
 	args := []string{
 		"-state", statePath,
-		testFixturePath("plan"),
 	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
 	// Verify that the provider was called with the existing state
@@ -422,34 +455,31 @@ func TestPlan_state(t *testing.T) {
 }
 
 func TestPlan_stateDefault(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	// Generate state and move it to the default path
 	originalState := testState()
 	statePath := testStateFile(t, originalState)
-
-	// Change to that directory
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if err := os.Chdir(filepath.Dir(statePath)); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.Chdir(cwd)
+	os.Rename(statePath, path.Join(td, "terraform.tfstate"))
 
 	p := planFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
-	args := []string{
-		"-state", statePath,
-		testFixturePath("plan"),
-	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	args := []string{}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
 	// Verify that the provider was called with the existing state
@@ -478,7 +508,7 @@ func TestPlan_validate(t *testing.T) {
 	defer testChdir(t, td)()
 
 	p := testProvider()
-	p.GetSchemaResponse = &providers.GetSchemaResponse{
+	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
 		ResourceTypes: map[string]providers.Schema{
 			"test_instance": {
 				Block: &configschema.Block{
@@ -494,35 +524,40 @@ func TestPlan_validate(t *testing.T) {
 			PlannedState: req.ProposedNewState,
 		}
 	}
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
-	args := []string{}
-	if code := c.Run(args); code != 1 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	args := []string{"-no-color"}
+	code := c.Run(args)
+	output := done(t)
+	if code != 1 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
-	actual := ui.ErrorWriter.String()
+	actual := output.Stderr()
 	if want := "Error: Invalid count argument"; !strings.Contains(actual, want) {
 		t.Fatalf("unexpected error output\ngot:\n%s\n\nshould contain: %s", actual, want)
 	}
 }
 
 func TestPlan_vars(t *testing.T) {
-	tmp, cwd := testCwd(t)
-	defer testFixCwd(t, tmp, cwd)
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan-vars"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
 	p := planVarsFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
@@ -535,10 +570,11 @@ func TestPlan_vars(t *testing.T) {
 
 	args := []string{
 		"-var", "foo=bar",
-		testFixturePath("plan-vars"),
 	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
 	if actual != "bar" {
@@ -547,8 +583,11 @@ func TestPlan_vars(t *testing.T) {
 }
 
 func TestPlan_varsUnset(t *testing.T) {
-	tmp, cwd := testCwd(t)
-	defer testFixCwd(t, tmp, cwd)
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan-vars"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
 	// The plan command will prompt for interactive input of var.foo.
 	// We'll answer "bar" to that prompt, which should then allow this
@@ -561,19 +600,19 @@ func TestPlan_varsUnset(t *testing.T) {
 	defer close()
 
 	p := planVarsFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
-	args := []string{
-		testFixturePath("plan-vars"),
-	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	args := []string{}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 }
 
@@ -581,8 +620,11 @@ func TestPlan_varsUnset(t *testing.T) {
 // processing of user input:
 // https://github.com/hashicorp/terraform/issues/26035
 func TestPlan_providerArgumentUnset(t *testing.T) {
-	tmp, cwd := testCwd(t)
-	defer testFixCwd(t, tmp, cwd)
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
 	// Disable test mode so input would be asked
 	test = false
@@ -593,7 +635,7 @@ func TestPlan_providerArgumentUnset(t *testing.T) {
 
 	p := planFixtureProvider()
 	// override the planFixtureProvider schema to include a required provider argument
-	p.GetSchemaResponse = &providers.GetSchemaResponse{
+	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
 		Provider: providers.Schema{
 			Block: &configschema.Block{
 				Attributes: map[string]*configschema.Attribute{
@@ -623,25 +665,28 @@ func TestPlan_providerArgumentUnset(t *testing.T) {
 			},
 		},
 	}
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
-	args := []string{
-		testFixturePath("plan"),
-	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	args := []string{}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 }
 
 func TestPlan_varFile(t *testing.T) {
-	tmp, cwd := testCwd(t)
-	defer testFixCwd(t, tmp, cwd)
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan-vars"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
 	varFilePath := testTempFile(t)
 	if err := ioutil.WriteFile(varFilePath, []byte(planVarFile), 0644); err != nil {
@@ -649,11 +694,11 @@ func TestPlan_varFile(t *testing.T) {
 	}
 
 	p := planVarsFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
@@ -666,10 +711,11 @@ func TestPlan_varFile(t *testing.T) {
 
 	args := []string{
 		"-var-file", varFilePath,
-		testFixturePath("plan-vars"),
 	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
 	if actual != "bar" {
@@ -678,27 +724,23 @@ func TestPlan_varFile(t *testing.T) {
 }
 
 func TestPlan_varFileDefault(t *testing.T) {
-	varFileDir := testTempDir(t)
-	varFilePath := filepath.Join(varFileDir, "terraform.tfvars")
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan-vars"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	varFilePath := filepath.Join(td, "terraform.tfvars")
 	if err := ioutil.WriteFile(varFilePath, []byte(planVarFile), 0644); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if err := os.Chdir(varFileDir); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.Chdir(cwd)
-
 	p := planVarsFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
@@ -709,11 +751,11 @@ func TestPlan_varFileDefault(t *testing.T) {
 		return
 	}
 
-	args := []string{
-		testFixturePath("plan-vars"),
-	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	args := []string{}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 
 	if actual != "bar" {
@@ -722,8 +764,11 @@ func TestPlan_varFileDefault(t *testing.T) {
 }
 
 func TestPlan_varFileWithDecls(t *testing.T) {
-	tmp, cwd := testCwd(t)
-	defer testFixCwd(t, tmp, cwd)
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("plan-vars"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
 
 	varFilePath := testTempFile(t)
 	if err := ioutil.WriteFile(varFilePath, []byte(planVarFileWithDecl), 0644); err != nil {
@@ -731,23 +776,24 @@ func TestPlan_varFileWithDecls(t *testing.T) {
 	}
 
 	p := planVarsFixtureProvider()
-	ui := cli.NewMockUi()
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
 	args := []string{
 		"-var-file", varFilePath,
-		testFixturePath("plan-vars"),
 	}
-	if code := c.Run(args); code == 0 {
-		t.Fatalf("succeeded; want failure\n\n%s", ui.OutputWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code == 0 {
+		t.Fatalf("succeeded; want failure\n\n%s", output.Stdout())
 	}
 
-	msg := ui.ErrorWriter.String()
+	msg := output.Stderr()
 	if got, want := msg, "Variable declaration in .tfvars file"; !strings.Contains(got, want) {
 		t.Fatalf("missing expected error message\nwant message containing %q\ngot:\n%s", want, got)
 	}
@@ -760,17 +806,19 @@ func TestPlan_detailedExitcode(t *testing.T) {
 	defer testChdir(t, td)()
 
 	p := planFixtureProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
 	args := []string{"-detailed-exitcode"}
-	if code := c.Run(args); code != 2 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 2 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 }
 
@@ -781,30 +829,38 @@ func TestPlan_detailedExitcode_emptyDiff(t *testing.T) {
 	defer testChdir(t, td)()
 
 	p := testProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 		},
 	}
 
 	args := []string{"-detailed-exitcode"}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
 	}
 }
 
 func TestPlan_shutdown(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("apply-shutdown"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
 	cancelled := make(chan struct{})
 	shutdownCh := make(chan struct{})
 
 	p := testProvider()
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
-			Ui:               ui,
+			View:             view,
 			ShutdownCh:       shutdownCh,
 		},
 	}
@@ -835,7 +891,7 @@ func TestPlan_shutdown(t *testing.T) {
 		return
 	}
 
-	p.GetSchemaResponse = &providers.GetSchemaResponse{
+	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
 		ResourceTypes: map[string]providers.Schema{
 			"test_instance": {
 				Block: &configschema.Block{
@@ -847,16 +903,10 @@ func TestPlan_shutdown(t *testing.T) {
 		},
 	}
 
-	code := c.Run([]string{
-		// Unfortunately it seems like this test can inadvertently pick up
-		// leftover state from other tests without this. Ideally we should
-		// find which test is leaving a terraform.tfstate behind and stop it
-		// doing that, but this will stop this test flapping for now.
-		"-state=nonexistent.tfstate",
-		testFixturePath("apply-shutdown"),
-	})
+	code := c.Run([]string{})
+	output := done(t)
 	if code != 1 {
-		t.Errorf("wrong exit code %d; want 1\noutput:\n%s", code, ui.OutputWriter.String())
+		t.Errorf("wrong exit code %d; want 1\noutput:\n%s", code, output.Stdout())
 	}
 
 	select {
@@ -872,29 +922,119 @@ func TestPlan_init_required(t *testing.T) {
 	defer os.RemoveAll(td)
 	defer testChdir(t, td)()
 
-	ui := new(cli.MockUi)
+	view, done := testView(t)
 	c := &PlanCommand{
 		Meta: Meta{
 			// Running plan without setting testingOverrides is similar to plan without init
-			Ui: ui,
+			View: view,
 		},
 	}
 
 	args := []string{}
-	if code := c.Run(args); code != 1 {
+	code := c.Run(args)
+	output := done(t)
+	if code != 1 {
 		t.Fatalf("expected error, got success")
 	}
-	output := ui.ErrorWriter.String()
-	if !strings.Contains(output, `Plugin reinitialization required. Please run "terraform init".`) {
-		t.Fatal("wrong error message in output:", output)
+	got := output.Stderr()
+	if !strings.Contains(got, `Plugin reinitialization required. Please run "terraform init".`) {
+		t.Fatal("wrong error message in output:", got)
+	}
+}
+
+// Config with multiple resources, targeting plan of a subset
+func TestPlan_targeted(t *testing.T) {
+	td := tempDir(t)
+	testCopyDir(t, testFixturePath("apply-targeted"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
+	p := testProvider()
+	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
+		ResourceTypes: map[string]providers.Schema{
+			"test_instance": {
+				Block: &configschema.Block{
+					Attributes: map[string]*configschema.Attribute{
+						"id": {Type: cty.String, Computed: true},
+					},
+				},
+			},
+		},
+	}
+	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
+		return providers.PlanResourceChangeResponse{
+			PlannedState: req.ProposedNewState,
+		}
+	}
+
+	view, done := testView(t)
+	c := &PlanCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			View:             view,
+		},
+	}
+
+	args := []string{
+		"-target", "test_instance.foo",
+		"-target", "test_instance.baz",
+	}
+	code := c.Run(args)
+	output := done(t)
+	if code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, output.Stderr())
+	}
+
+	if got, want := output.Stdout(), "3 to add, 0 to change, 0 to destroy"; !strings.Contains(got, want) {
+		t.Fatalf("bad change summary, want %q, got:\n%s", want, got)
+	}
+}
+
+// Diagnostics for invalid -target flags
+func TestPlan_targetFlagsDiags(t *testing.T) {
+	testCases := map[string]string{
+		"test_instance.": "Dot must be followed by attribute name.",
+		"test_instance":  "Resource specification must include a resource type and name.",
+	}
+
+	for target, wantDiag := range testCases {
+		t.Run(target, func(t *testing.T) {
+			td := testTempDir(t)
+			defer os.RemoveAll(td)
+			defer testChdir(t, td)()
+
+			view, done := testView(t)
+			c := &PlanCommand{
+				Meta: Meta{
+					View: view,
+				},
+			}
+
+			args := []string{
+				"-target", target,
+			}
+			code := c.Run(args)
+			output := done(t)
+			if code != 1 {
+				t.Fatalf("bad: %d\n\n%s", code, output.Stdout())
+			}
+
+			got := output.Stderr()
+			if !strings.Contains(got, target) {
+				t.Fatalf("bad error output, want %q, got:\n%s", target, got)
+			}
+			if !strings.Contains(got, wantDiag) {
+				t.Fatalf("bad error output, want %q, got:\n%s", wantDiag, got)
+			}
+		})
 	}
 }
 
 // planFixtureSchema returns a schema suitable for processing the
 // configuration in testdata/plan . This schema should be
 // assigned to a mock provider named "test".
-func planFixtureSchema() *providers.GetSchemaResponse {
-	return &providers.GetSchemaResponse{
+func planFixtureSchema() *providers.GetProviderSchemaResponse {
+	return &providers.GetProviderSchemaResponse{
 		ResourceTypes: map[string]providers.Schema{
 			"test_instance": {
 				Block: &configschema.Block{
@@ -925,7 +1065,7 @@ func planFixtureSchema() *providers.GetSchemaResponse {
 // step just passing through the new object proposed by Terraform Core.
 func planFixtureProvider() *terraform.MockProvider {
 	p := testProvider()
-	p.GetSchemaResponse = planFixtureSchema()
+	p.GetProviderSchemaResponse = planFixtureSchema()
 	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
 		return providers.PlanResourceChangeResponse{
 			PlannedState: req.ProposedNewState,
@@ -937,8 +1077,8 @@ func planFixtureProvider() *terraform.MockProvider {
 // planVarsFixtureSchema returns a schema suitable for processing the
 // configuration in testdata/plan-vars . This schema should be
 // assigned to a mock provider named "test".
-func planVarsFixtureSchema() *providers.GetSchemaResponse {
-	return &providers.GetSchemaResponse{
+func planVarsFixtureSchema() *providers.GetProviderSchemaResponse {
+	return &providers.GetProviderSchemaResponse{
 		ResourceTypes: map[string]providers.Schema{
 			"test_instance": {
 				Block: &configschema.Block{
@@ -958,7 +1098,7 @@ func planVarsFixtureSchema() *providers.GetSchemaResponse {
 // step just passing through the new object proposed by Terraform Core.
 func planVarsFixtureProvider() *terraform.MockProvider {
 	p := testProvider()
-	p.GetSchemaResponse = planVarsFixtureSchema()
+	p.GetProviderSchemaResponse = planVarsFixtureSchema()
 	p.PlanResourceChangeFn = func(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
 		return providers.PlanResourceChangeResponse{
 			PlannedState: req.ProposedNewState,

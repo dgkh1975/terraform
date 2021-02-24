@@ -1,6 +1,7 @@
 package terraform
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/hashicorp/terraform/addrs"
@@ -54,11 +55,6 @@ resource "test_object" "a" {
 			t.Fatalf("expected Create action for missing %s, got %s", c.Addr, c.Action)
 		}
 	}
-
-	_, diags = ctx.Apply()
-	if diags.HasErrors() {
-		t.Fatal(diags.Err())
-	}
 }
 
 func TestContext2Plan_noChangeDataSourceSensitiveNestedSet(t *testing.T) {
@@ -78,7 +74,7 @@ data "test_data_source" "foo" {
 	})
 
 	p := new(MockProvider)
-	p.GetSchemaResponse = getSchemaResponseFromProviderSchema(&ProviderSchema{
+	p.GetProviderSchemaResponse = getProviderSchemaResponseFromProviderSchema(&ProviderSchema{
 		DataSources: map[string]*configschema.Block{
 			"test_data_source": {
 				Attributes: map[string]*configschema.Attribute{
@@ -142,5 +138,114 @@ data "test_data_source" "foo" {
 		if res.Action != plans.NoOp {
 			t.Fatalf("expected NoOp, got: %q %s", res.Addr, res.Action)
 		}
+	}
+}
+
+func TestContext2Plan_orphanDataInstance(t *testing.T) {
+	// ensure the planned replacement of the data source is evaluated properly
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+data "test_object" "a" {
+  for_each = { new = "ok" }
+}
+
+output "out" {
+  value = [ for k, _ in data.test_object.a: k ]
+}
+`,
+	})
+
+	p := simpleMockProvider()
+	p.ReadDataSourceFn = func(req providers.ReadDataSourceRequest) (resp providers.ReadDataSourceResponse) {
+		resp.State = req.Config
+		return resp
+	}
+
+	state := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(mustResourceInstanceAddr(`data.test_object.a["old"]`), &states.ResourceInstanceObjectSrc{
+			AttrsJSON: []byte(`{"test_string":"foo"}`),
+			Status:    states.ObjectReady,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+	})
+
+	ctx := testContext2(t, &ContextOpts{
+		Config: m,
+		State:  state,
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	plan, diags := ctx.Plan()
+	if diags.HasErrors() {
+		t.Fatal(diags.Err())
+	}
+
+	change, err := plan.Changes.Outputs[0].Decode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := cty.TupleVal([]cty.Value{cty.StringVal("new")})
+
+	if change.After.Equals(expected).False() {
+		t.Fatalf("expected %#v, got %#v\n", expected, change.After)
+	}
+}
+
+func TestContext2Plan_basicConfigurationAliases(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+provider "test" {
+  alias = "z"
+  test_string = "config"
+}
+
+module "mod" {
+  source = "./mod"
+  providers = {
+    test.x = test.z
+  }
+}
+`,
+
+		"mod/main.tf": `
+terraform {
+  required_providers {
+    test = {
+      source = "registry.terraform.io/hashicorp/test"
+      configuration_aliases = [ test.x ]
+	}
+  }
+}
+
+resource "test_object" "a" {
+  provider = test.x
+}
+
+`,
+	})
+
+	p := simpleMockProvider()
+
+	// The resource within the module should be using the provider configured
+	// from the root module. We should never see an empty configuration.
+	p.ConfigureProviderFn = func(req providers.ConfigureProviderRequest) (resp providers.ConfigureProviderResponse) {
+		if req.Config.GetAttr("test_string").IsNull() {
+			resp.Diagnostics = resp.Diagnostics.Append(errors.New("missing test_string value"))
+		}
+		return resp
+	}
+
+	ctx := testContext2(t, &ContextOpts{
+		Config: m,
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	_, diags := ctx.Plan()
+	if diags.HasErrors() {
+		t.Fatal(diags.Err())
 	}
 }

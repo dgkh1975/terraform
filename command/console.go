@@ -104,9 +104,9 @@ func (c *ConsoleCommand) Run(args []string) int {
 
 	// Successfully creating the context can result in a lock, so ensure we release it
 	defer func() {
-		err := opReq.StateLocker.Unlock(nil)
-		if err != nil {
-			c.Ui.Error(err.Error())
+		diags := opReq.StateLocker.Unlock()
+		if diags.HasErrors() {
+			c.showDiagnostics(diags)
 		}
 	}()
 
@@ -175,7 +175,7 @@ func (c *ConsoleCommand) modePiped(session *repl.Session, ui cli.Ui) int {
 
 func (c *ConsoleCommand) Help() string {
 	helpText := `
-Usage: terraform console [options] [DIR]
+Usage: terraform [global options] console [options]
 
   Starts an interactive console for experimenting with Terraform
   interpolations.
@@ -186,9 +186,6 @@ Usage: terraform console [options] [DIR]
   using them in future configurations.
 
   This command will never modify your state.
-
-  DIR can be set to a directory with a Terraform state to load. By
-  default, this will default to the current working directory.
 
 Options:
 

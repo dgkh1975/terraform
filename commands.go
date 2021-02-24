@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/command"
 	"github.com/hashicorp/terraform/command/cliconfig"
+	"github.com/hashicorp/terraform/command/views"
 	"github.com/hashicorp/terraform/command/webbrowser"
 	"github.com/hashicorp/terraform/internal/getproviders"
 	"github.com/hashicorp/terraform/internal/terminal"
@@ -81,6 +82,7 @@ func initCommands(
 	meta := command.Meta{
 		OriginalWorkingDir: originalWorkingDir,
 		Streams:            streams,
+		View:               views.NewView(streams),
 
 		Color:            true,
 		GlobalPluginDirs: globalPluginDirs(),
@@ -264,6 +266,12 @@ func initCommands(
 			}, nil
 		},
 
+		"test": func() (cli.Command, error) {
+			return &command.TestCommand{
+				Meta: meta,
+			}, nil
+		},
+
 		"validate": func() (cli.Command, error) {
 			return &command.ValidateCommand{
 				Meta: meta,
@@ -325,18 +333,6 @@ func initCommands(
 		//-----------------------------------------------------------
 		// Plumbing
 		//-----------------------------------------------------------
-
-		"0.12upgrade": func() (cli.Command, error) {
-			return &command.ZeroTwelveUpgradeCommand{
-				Meta: meta,
-			}, nil
-		},
-
-		"0.13upgrade": func() (cli.Command, error) {
-			return &command.ZeroThirteenUpgradeCommand{
-				Meta: meta,
-			}, nil
-		},
 
 		"force-unlock": func() (cli.Command, error) {
 			return &command.UnlockCommand{
@@ -406,8 +402,6 @@ func initCommands(
 	}
 
 	HiddenCommands = map[string]struct{}{
-		"0.12upgrade":     struct{}{},
-		"0.13upgrade":     struct{}{},
 		"env":             struct{}{},
 		"internal-plugin": struct{}{},
 		"push":            struct{}{},

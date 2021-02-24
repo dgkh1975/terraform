@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
@@ -59,31 +58,17 @@ func (c *InitCommand) Run(args []string) int {
 		c.pluginPath = flagPluginPath
 	}
 
-	// Validate the arg count
+	// Validate the arg count and get the working directory
 	args = cmdFlags.Args()
-	if len(args) > 1 {
-		c.Ui.Error("The init command expects at most one argument.\n")
-		cmdFlags.Usage()
+	path, err := ModulePath(args)
+	if err != nil {
+		c.Ui.Error(err.Error())
 		return 1
 	}
 
 	if err := c.storePluginPath(c.pluginPath); err != nil {
 		c.Ui.Error(fmt.Sprintf("Error saving -plugin-path values: %s", err))
 		return 1
-	}
-
-	// Get our pwd. We don't always need it but always getting it is easier
-	// than the logic to determine if it is or isn't needed.
-	pwd, err := os.Getwd()
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Error getting pwd: %s", err))
-		return 1
-	}
-
-	// If an argument is provided then it overrides our working directory.
-	path := pwd
-	if len(args) == 1 {
-		path = args[0]
 	}
 
 	// This will track whether we outputted anything so that we know whether
@@ -407,6 +392,12 @@ the backend configuration is present and valid.
 // Load the complete module tree, and fetch any missing providers.
 // This method outputs its own Ui.
 func (c *InitCommand) getProviders(config *configs.Config, state *states.State, upgrade bool, pluginDirs []string) (output, abort bool, diags tfdiags.Diagnostics) {
+	// Dev overrides cause the result of "terraform init" to be irrelevant for
+	// any overridden providers, so we'll warn about it to avoid later
+	// confusion when Terraform ends up using a different provider than the
+	// lock file called for.
+	diags = diags.Append(c.providerDevOverrideInitWarnings())
+
 	// First we'll collect all the provider dependencies we can see in the
 	// configuration and the state.
 	reqs, hclDiags := config.ProviderRequirements()
@@ -732,12 +723,6 @@ func (c *InitCommand) getProviders(config *configs.Config, state *states.State, 
 	}
 	ctx = evts.OnContext(ctx)
 
-	// Dev overrides cause the result of "terraform init" to be irrelevant for
-	// any overridden providers, so we'll warn about it to avoid later
-	// confusion when Terraform ends up using a different provider than the
-	// lock file called for.
-	diags = diags.Append(c.providerDevOverrideWarnings())
-
 	mode := providercache.InstallNewProvidersOnly
 	if upgrade {
 		mode = providercache.InstallUpgrades
@@ -924,7 +909,7 @@ func (c *InitCommand) AutocompleteFlags() complete.Flags {
 
 func (c *InitCommand) Help() string {
 	helpText := `
-Usage: terraform init [options] [DIR]
+Usage: terraform [global options] init [options]
 
   Initialize a new or existing Terraform working directory by creating
   initial files, loading any remote state, downloading modules, etc.
@@ -938,9 +923,6 @@ Usage: terraform init [options] [DIR]
   may give errors, this command will never delete your configuration or
   state. Even so, if you have important information, please back it up prior
   to running this command, just in case.
-
-  If no arguments are given, the configuration in this working directory
-  is initialized.
 
 Options:
 

@@ -15,8 +15,10 @@ import (
 	terraformProvider "github.com/hashicorp/terraform/builtin/providers/terraform"
 	"github.com/hashicorp/terraform/internal/getproviders"
 	"github.com/hashicorp/terraform/internal/logging"
+	"github.com/hashicorp/terraform/internal/moduletest"
 	"github.com/hashicorp/terraform/internal/providercache"
 	tfplugin "github.com/hashicorp/terraform/plugin"
+	tfplugin6 "github.com/hashicorp/terraform/plugin6"
 	"github.com/hashicorp/terraform/providers"
 	"github.com/hashicorp/terraform/tfdiags"
 )
@@ -152,8 +154,35 @@ func (m *Meta) providerInstallSource() getproviders.Source {
 	return m.ProviderSource
 }
 
-// providerDevOverrideWarnings returns a diagnostics that contains at least
-// one warning if and only if there is at least one provider development
+// providerDevOverrideInitWarnings returns a diagnostics that contains at
+// least one warning if and only if there is at least one provider development
+// override in effect. If not, the result is always empty. The result never
+// contains error diagnostics.
+//
+// The init command can use this to include a warning that the results
+// may differ from what's expected due to the development overrides. For
+// other commands, providerDevOverrideRuntimeWarnings should be used.
+func (m *Meta) providerDevOverrideInitWarnings() tfdiags.Diagnostics {
+	if len(m.ProviderDevOverrides) == 0 {
+		return nil
+	}
+	var detailMsg strings.Builder
+	detailMsg.WriteString("The following provider development overrides are set in the CLI configuration:\n")
+	for addr, path := range m.ProviderDevOverrides {
+		detailMsg.WriteString(fmt.Sprintf(" - %s in %s\n", addr.ForDisplay(), path))
+	}
+	detailMsg.WriteString("\nSkip terraform init when using provider development overrides. It is not necessary and may error unexpectedly.")
+	return tfdiags.Diagnostics{
+		tfdiags.Sourceless(
+			tfdiags.Warning,
+			"Provider development overrides are in effect",
+			detailMsg.String(),
+		),
+	}
+}
+
+// providerDevOverrideRuntimeWarnings returns a diagnostics that contains at
+// least one warning if and only if there is at least one provider development
 // override in effect. If not, the result is always empty. The result never
 // contains error diagnostics.
 //
@@ -162,7 +191,10 @@ func (m *Meta) providerInstallSource() getproviders.Source {
 // not necessary to bother the user with this warning on every command, but
 // it's helpful to return it on commands that have externally-visible side
 // effects and on commands that are used to verify conformance to schemas.
-func (m *Meta) providerDevOverrideWarnings() tfdiags.Diagnostics {
+//
+// See providerDevOverrideInitWarnings for warnings specific to the init
+// command.
+func (m *Meta) providerDevOverrideRuntimeWarnings() tfdiags.Diagnostics {
 	if len(m.ProviderDevOverrides) == 0 {
 		return nil
 	}
@@ -295,6 +327,9 @@ func (m *Meta) internalProviders() map[string]providers.Factory {
 		"terraform": func() (providers.Interface, error) {
 			return terraformProvider.NewProvider(), nil
 		},
+		"test": func() (providers.Interface, error) {
+			return moduletest.NewProvider(), nil
+		},
 	}
 }
 
@@ -330,10 +365,19 @@ func providerFactory(meta *providercache.CachedProvider) providers.Factory {
 		}
 
 		// store the client so that the plugin can kill the child process
-		p := raw.(*tfplugin.GRPCProvider)
-		p.PluginClient = client
-
-		return p, nil
+		protoVer := client.NegotiatedVersion()
+		switch protoVer {
+		case 5:
+			p := raw.(*tfplugin.GRPCProvider)
+			p.PluginClient = client
+			return p, nil
+		case 6:
+			p := raw.(*tfplugin6.GRPCProvider)
+			p.PluginClient = client
+			return p, nil
+		default:
+			panic("unsupported protocol version")
+		}
 	}
 }
 

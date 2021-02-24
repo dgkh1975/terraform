@@ -15,11 +15,15 @@ import (
 	"time"
 
 	plugin "github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/terraform-svchost/disco"
 	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/backend/local"
+	"github.com/hashicorp/terraform/command/arguments"
 	"github.com/hashicorp/terraform/command/format"
+	"github.com/hashicorp/terraform/command/views"
 	"github.com/hashicorp/terraform/command/webbrowser"
 	"github.com/hashicorp/terraform/configs/configload"
 	"github.com/hashicorp/terraform/internal/getproviders"
@@ -60,12 +64,11 @@ type Meta struct {
 	// do some default behavior instead if so, rather than panicking.
 	Streams *terminal.Streams
 
+	View *views.View
+
 	Color            bool     // True if output should be colored
 	GlobalPluginDirs []string // Additional paths to search for plugins
 	Ui               cli.Ui   // Ui for output
-
-	// ExtraHooks are extra hooks to add to the context.
-	ExtraHooks []terraform.Hook
 
 	// Services provides access to remote endpoint information for
 	// "terraform-native' services running at a specific user-facing hostname.
@@ -164,7 +167,8 @@ type Meta struct {
 	input        bool
 
 	// Targets for this context (private)
-	targets []addrs.Targetable
+	targets     []addrs.Targetable
+	targetFlags []string
 
 	// Internal fields
 	color bool
@@ -372,6 +376,9 @@ func (m *Meta) InterruptibleContext() (context.Context, context.CancelFunc) {
 // operation itself is unsuccessful. Use the "Result" field of the
 // returned operation object to recognize operation-level failure.
 func (m *Meta) RunOperation(b backend.Enhanced, opReq *backend.Operation) (*backend.RunningOperation, error) {
+	if opReq.View == nil {
+		panic("RunOperation called with nil View")
+	}
 	if opReq.ConfigDir != "" {
 		opReq.ConfigDir = m.normalizePath(opReq.ConfigDir)
 	}
@@ -388,14 +395,12 @@ func (m *Meta) RunOperation(b backend.Enhanced, opReq *backend.Operation) (*back
 		op.Stop()
 
 		// Notify the user
-		m.Ui.Output(outputInterrupt)
+		opReq.View.Interrupted()
 
 		// Still get the result, since there is still one
 		select {
 		case <-m.ShutdownCh:
-			m.Ui.Error(
-				"Two interrupts received. Exiting immediately. Note that data\n" +
-					"loss may have occurred.")
+			opReq.View.FatalInterrupt()
 
 			// cancel the operation completely
 			op.Cancel()
@@ -428,8 +433,6 @@ func (m *Meta) contextOpts() (*terraform.ContextOpts, error) {
 	}
 
 	var opts terraform.ContextOpts
-	opts.Hooks = []terraform.Hook{m.uiHook()}
-	opts.Hooks = append(opts.Hooks, m.ExtraHooks...)
 
 	opts.Targets = m.targets
 	opts.UIInput = m.UIInput()
@@ -496,6 +499,7 @@ func (m *Meta) contextOpts() (*terraform.ContextOpts, error) {
 }
 
 // defaultFlagSet creates a default flag set for commands.
+// See also command/arguments/default.go
 func (m *Meta) defaultFlagSet(n string) *flag.FlagSet {
 	f := flag.NewFlagSet(n, flag.ContinueOnError)
 	f.SetOutput(ioutil.Discard)
@@ -523,7 +527,7 @@ func (m *Meta) extendedFlagSet(n string) *flag.FlagSet {
 	f := m.defaultFlagSet(n)
 
 	f.BoolVar(&m.input, "input", true, "input")
-	f.Var((*FlagTargetSlice)(&m.targets), "target", "resource to target")
+	f.Var((*FlagStringSlice)(&m.targetFlags), "target", "resource to target")
 	f.BoolVar(&m.compactWarnings, "compact-warnings", false, "use compact warnings")
 
 	if m.variableArgs.items == nil {
@@ -541,9 +545,46 @@ func (m *Meta) extendedFlagSet(n string) *flag.FlagSet {
 	return f
 }
 
-// process will process the meta-parameters out of the arguments. This
+// parseTargetFlags must be called for any commands supporting -target
+// arguments. This method attempts to parse each -target flag into an
+// addrs.Target, storing in the Meta.targets slice.
+//
+// If any flags cannot be parsed, we rewrap the first error diagnostic with a
+// custom title to clarify the source of the error. The normal approach of
+// directly returning the diags from HCL or the addrs package results in
+// confusing incorrect "source" results when presented.
+func (m *Meta) parseTargetFlags() tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+	m.targets = nil
+	for _, tf := range m.targetFlags {
+		traversal, syntaxDiags := hclsyntax.ParseTraversalAbs([]byte(tf), "", hcl.Pos{Line: 1, Column: 1})
+		if syntaxDiags.HasErrors() {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				fmt.Sprintf("Invalid target %q", tf),
+				syntaxDiags[0].Detail,
+			))
+			continue
+		}
+
+		target, targetDiags := addrs.ParseTarget(traversal)
+		if targetDiags.HasErrors() {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				fmt.Sprintf("Invalid target %q", tf),
+				targetDiags[0].Description().Detail,
+			))
+			continue
+		}
+
+		m.targets = append(m.targets, target.Subject)
+	}
+	return diags
+}
+
+// process will process any -no-color entries out of the arguments. This
 // will potentially modify the args in-place. It will return the resulting
-// slice.
+// slice, and update the Meta and Ui.
 func (m *Meta) process(args []string) []string {
 	// We do this so that we retain the ability to technically call
 	// process multiple times, even if we have no plans to do so
@@ -577,15 +618,21 @@ func (m *Meta) process(args []string) []string {
 		},
 	}
 
+	// Reconfigure the view. This is necessary for commands which use both
+	// views.View and cli.Ui during the migration phase.
+	if m.View != nil {
+		m.View.Configure(&arguments.View{
+			CompactWarnings: m.compactWarnings,
+			NoColor:         !m.Color,
+		})
+	}
+
 	return args
 }
 
 // uiHook returns the UiHook to use with the context.
-func (m *Meta) uiHook() *UiHook {
-	return &UiHook{
-		Colorize: m.Colorize(),
-		Ui:       m.Ui,
-	}
+func (m *Meta) uiHook() *views.UiHook {
+	return views.NewUiHook(m.View)
 }
 
 // confirm asks a yes/no confirmation.
@@ -735,4 +782,15 @@ func (m *Meta) SetWorkspace(name string) error {
 func isAutoVarFile(path string) bool {
 	return strings.HasSuffix(path, ".auto.tfvars") ||
 		strings.HasSuffix(path, ".auto.tfvars.json")
+}
+
+// FIXME: as an interim refactoring step, we apply the contents of the state
+// arguments directly to the Meta object. Future work would ideally update the
+// code paths which use these arguments to be passed them directly for clarity.
+func (m *Meta) applyStateArguments(args *arguments.State) {
+	m.stateLock = args.Lock
+	m.stateLockTimeout = args.LockTimeout
+	m.statePath = args.StatePath
+	m.stateOutPath = args.StateOutPath
+	m.backupPath = args.BackupPath
 }

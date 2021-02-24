@@ -12,6 +12,8 @@ import (
 
 	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/backend"
+	"github.com/hashicorp/terraform/command/arguments"
+	"github.com/hashicorp/terraform/command/views"
 	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
@@ -189,6 +191,7 @@ func (c *ImportCommand) Run(args []string) int {
 		c.showDiagnostics(diags)
 		return 1
 	}
+	opReq.Hooks = []terraform.Hook{c.uiHook()}
 	{
 		var moreDiags tfdiags.Diagnostics
 		opReq.Variables, moreDiags = c.collectVariableValues()
@@ -198,6 +201,7 @@ func (c *ImportCommand) Run(args []string) int {
 			return 1
 		}
 	}
+	opReq.View = views.NewOperation(arguments.ViewHuman, c.RunningInAutomation, c.View)
 
 	// Check remote Terraform version is compatible
 	remoteVersionDiags := c.remoteBackendVersionCheck(b, opReq.Workspace)
@@ -217,9 +221,9 @@ func (c *ImportCommand) Run(args []string) int {
 
 	// Successfully creating the context can result in a lock, so ensure we release it
 	defer func() {
-		err := opReq.StateLocker.Unlock(nil)
-		if err != nil {
-			c.Ui.Error(err.Error())
+		diags := opReq.StateLocker.Unlock()
+		if diags.HasErrors() {
+			c.showDiagnostics(diags)
 		}
 	}()
 
@@ -267,7 +271,7 @@ func (c *ImportCommand) Run(args []string) int {
 
 func (c *ImportCommand) Help() string {
 	helpText := `
-Usage: terraform import [options] ADDR ID
+Usage: terraform [global options] import [options] ADDR ID
 
   Import existing infrastructure into your Terraform state.
 
